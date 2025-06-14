@@ -129,7 +129,7 @@ class Connect4Net(nn.Module): # TODO subclass PolicyNet?
         return self.p_head(h), torch.tanh(self.v_head(h)).squeeze(-1)
     
     @torch.no_grad()
-    def act_prob(self, state, legalActions):
+    def act_prob(self, state, legalActions): # TODO change name -- we also return value. maybe predict?
         # used during MTCS search to get the prior policy and value
 
         self.eval()

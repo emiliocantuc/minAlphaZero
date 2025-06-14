@@ -1,8 +1,5 @@
 """
 A toy implementation of AlphaZero. 
-
-At a high level, what happens is:
-TODO
 """
 
 import torch
@@ -57,12 +54,12 @@ class MCTS:
 
         self.visited = set() # during search
 
-    def reset(self):
-        self.Qsa.clear()
-        self.Nsa.clear()
-        self.Ns.clear()
-        self.Ps.clear()
-        self.visited.clear()
+    # def reset(self):
+    #     self.Qsa.clear()
+    #     self.Nsa.clear()
+    #     self.Ns.clear()
+    #     self.Ps.clear()
+    #     self.visited.clear()
 
     def search(self, cstate, game, net_act_prob):
 
@@ -90,15 +87,16 @@ class MCTS:
         # take action and recurse
         next_state = game.state2canonical(game.nextState(state, best_action))
         v = self.search(next_state, game, net_act_prob)
-
+    
         # update Q and N values
         Q, Nsa, Ns = self.Qsa[hstate, best_action], self.Nsa[hstate, best_action], self.Ns[hstate]
 
-        self.Qsa[hstate, best_action] = (Q * Nsa + v) / (Nsa + 1) # rolling average
+        # note that we flip v's sign
+        self.Qsa[hstate, best_action] = (Q * Nsa - v) / (Nsa + 1) # update rolling average
         self.Nsa[hstate, best_action] = Nsa + 1
         self.Ns[hstate] = Ns + 1
 
-        return -v
+        return v
     
     def UCT(self, hstate, action):
 
@@ -114,9 +112,9 @@ class MCTS:
         state = game.state2canonical(state)
         hstate = game.state2str(state)
 
-        # reset visited states
-        # TODO do i want to reset everything?
-        self.reset()
+        # note: we reset the tree between moves but more efficient approaches exist
+        # e.g. root-shift
+        # self.reset()
 
         # run MCTS search
         for _ in range(n):
@@ -147,43 +145,36 @@ class PolicyNet(nn.Module):
 
 class Policy:
 
-    def __init__(self, net, game):
+    def __init__(self, net, game, n, temp = 1.0):
         self.net = net
         self.game = game
+        self.n = n
+        self.temp = temp
+        self.new_game()
 
-        self.reset_mcts()
-    
-    def reset_mcts(self):
+    def new_game(self):
         self.mcts = MCTS()
     
     @torch.no_grad()
-    def act_prob(self, state, temp = 1.0, n = 100):
+    def act(self, state):
         # used during self-play as 'target policy'
 
-        # to easily ablate mcts 
-        if n > 0:    
-            # TODO dont forget temp
-            p_improved = self.mcts.improved_policy(state, self.game, self.net.act_prob, n = n)
-            return p_improved
-        
+        if self.n > 0: # to easily ablate mcts  
+            p = self.mcts.improved_policy(state, self.game, self.net.act_prob, n = self.n)
+            norm = sum(pa ** (1. / self.temp) for pa in p.values())
+            p = {a: (pa ** (1. / self.temp)) / norm for a, pa in p.items()} 
         else:
             # just use the network to get the prior policy
             state = self.game.state2canonical(state)
             p, _ = self.net.act_prob(state)
-            return p
+
+        _p = np.array(list(p.values())).astype(np.float64)
+        _p = _p / np.sum(_p)
+        action = np.random.choice(list(p.keys()), p = _p)
+
+        return action, p
     
-    @torch.no_grad()
-    def act(self, act_probs, legal_actions = None):
-        # just because `choice` sometimes complains probs do not sum to 1
-        if legal_actions:
-            act_probs = {a: pa for a, pa in act_probs.items() if a in legal_actions}
-
-        p = np.array(list(act_probs.values())).astype(np.float64)
-        p = p / np.sum(p)
-        return np.random.choice(list(act_probs.keys()), p = p)
-
-
-def self_play(game, policy, n_games = 1, act_prob_kwargs = {}):
+def self_play(game, policy, n_games = 1): 
     '''
     Plays policy against itself and collects training examples.
     Each example is a tuple of (canonical_state, policy, value).
@@ -193,15 +184,13 @@ def self_play(game, policy, n_games = 1, act_prob_kwargs = {}):
 
     for i in tqdm(range(n_games), desc='self playing'):
 
-        policy.reset_mcts() # TODO here?
-        
+        policy.new_game()
         state = game.initState(player = 1 if i % 2 == 0 else -1)
         _examples = []
         
         while not game.gameOver(state):
 
-            p = policy.act_prob(state, **act_prob_kwargs)
-            action = policy.act(p)
+            action, p = policy.act_prob(state)
 
             # TODO what do we need to return current player for?
             _, player = state
@@ -237,7 +226,7 @@ def train(net, examples):
     optimizer = torch.optim.AdamW(net.parameters(), lr=0.001)
     device = net.device
 
-    for epoch in range(10):  # number of epochs
+    for epoch in range(5):  # number of epochs
         losses = []
         for b, target_v, target_p in dl:
 
@@ -260,14 +249,15 @@ def train(net, examples):
         print(f'Epoch {epoch}, Avg. loss: {np.mean(losses):.4f}')
 
 
-def pit(game, p1_fn, pm1_fn, num_games=50):
+def pit(game, p1, pm1, num_games=50):
     results = []
     for i in tqdm(range(num_games), desc='pitting policies'):
+        p1.new_game(); pm1.new_game()
         state = game.initState(player = 1 if i % 2 == 0 else -1)
         while not game.gameOver(state):
             board, player = state
-            policy = p1_fn if player == 1 else pm1_fn
-            action = policy(state, game.legalActions(state))
+            policy = p1 if player == 1 else pm1
+            action, _ = policy.act(state)
             state = game.nextState(state, action) # this auto alternates player
         results.append(game.winner(state))
 
@@ -281,19 +271,14 @@ if __name__ == '__main__':
 
     game = Connect4()
     net = Connect4Net(game, device)
-    policy = Policy(net, game)
+    policy = Policy(net, game, n = 20, temp = 1.0)
 
     # import pdb; pdb.set_trace()
 
-    n_episodes = 1#100 
-    n_self_play_games = 50
+    n_episodes = 10#100 
+    n_self_play_games = 100
 
     example_buffer_size = 100_000
-
-    policy_act_prob_kwargs = {
-        'temp': 1.0,   # temperature for exploration
-        'n': 50,       # number of MCTS simulations
-    }
 
     # main loop:
     examples = []
@@ -309,18 +294,16 @@ if __name__ == '__main__':
         # keep copy of the network
         torch.save(policy, 'current_policy.pth')
 
-        # train the network on the examples
+        # train the network on the self-play examples
         # train(policy.net, examples)
 
         # pit the networks against each other and keep best
         old_policy = torch.load('current_policy.pth', weights_only = False)
 
-        pit_results = pit(
-            game,
-            lambda s, l: policy.act(policy.act_prob(s, **{'temp':1.0, 'n': 50}), l),
-            lambda s, l: old_policy.act(old_policy.act_prob(s, **{'temp':1.0, 'n':5}), l),
-            num_games = 50 # 100
-        )
+        policy.n = 50
+        old_policy.n = 5
+
+        pit_results = pit(game, policy, old_policy, num_games = 50)
 
         print(pit_results.mean())
         print('new policy pit results:')
